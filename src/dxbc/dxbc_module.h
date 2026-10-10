@@ -16,6 +16,42 @@ namespace dxvk {
   
   class DxbcAnalyzer;
   class DxbcCompiler;
+
+  /**
+   * \brief DXBC shader source
+   *
+   * Keeps the original byte code and module info of a shader
+   * around so that it can be recompiled later, e.g. when it
+   * needs to be combined with a geometry shader.
+   */
+  class DxbcShaderSource : public RcObject {
+
+  public:
+
+    DxbcShaderSource(
+      const void*           pBytecode,
+            size_t          length,
+      const DxbcModuleInfo& moduleInfo)
+    : m_code(reinterpret_cast<const char*>(pBytecode),
+             reinterpret_cast<const char*>(pBytecode) + length),
+      m_moduleInfo(moduleInfo) {
+      // Pointers refer to temporary data, so they are not kept
+      m_hasXfb = moduleInfo.xfb != nullptr;
+      m_moduleInfo.tess = nullptr;
+      m_moduleInfo.xfb  = nullptr;
+    }
+
+    bool hasXfb() const { return m_hasXfb; }
+    const std::vector<char>& code() const { return m_code; }
+    const DxbcModuleInfo& moduleInfo() const { return m_moduleInfo; }
+
+  private:
+
+    std::vector<char> m_code;
+    DxbcModuleInfo    m_moduleInfo;
+    bool              m_hasXfb = false;
+
+  };
   
   /**
    * \brief DXBC shader module
@@ -73,6 +109,25 @@ namespace dxvk {
     Rc<DxvkShader> compilePassthroughShader(
       const DxbcModuleInfo& moduleInfo,
       const std::string&    fileName) const;
+
+    /**
+     * \brief Compiles vertex shader and this geometry shader
+     *
+     * Creates a vertex shader that emulates the given point list
+     * to triangle strip geometry shader on hardware that does not
+     * support geometry shaders. The shader is invoked once per
+     * vertex that the geometry shader may emit (vertex index) and
+     * once per input point (instance index).
+     * \param [in] vsModule Vertex shader that feeds the GS
+     * \param [in] vsInfo DXBC module info of the vertex shader
+     * \param [in] gsInfo DXBC module info of this shader
+     * \param [in] fileName SPIR-V shader name
+     */
+    Rc<DxvkShader> compileFusedGs(
+      const DxbcModule&     vsModule,
+      const DxbcModuleInfo& vsInfo,
+      const DxbcModuleInfo& gsInfo,
+      const std::string&    fileName) const;
     
   private:
     
@@ -83,6 +138,9 @@ namespace dxvk {
     Rc<DxbcIsgn> m_psgnChunk;
     Rc<DxbcShex> m_shexChunk;
     
+    uint32_t countEffectiveCuts(
+            DxbcCodeSlice       slice) const;
+
     void runAnalyzer(
             DxbcAnalyzer&       analyzer,
             DxbcCodeSlice       slice) const;

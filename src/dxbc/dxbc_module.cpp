@@ -86,6 +86,100 @@ namespace dxvk {
   }
 
 
+  Rc<DxvkShader> DxbcModule::compileFusedGs(
+    const DxbcModule&     vsModule,
+    const DxbcModuleInfo& vsInfo,
+    const DxbcModuleInfo& gsInfo,
+    const std::string&    fileName) const {
+    if (m_shexChunk == nullptr || vsModule.m_shexChunk == nullptr)
+      throw DxvkError("DxbcModule::compileFusedGs: No SHDR/SHEX chunk");
+
+    if (m_shexChunk->programInfo().type() != DxbcProgramType::GeometryShader
+     || vsModule.m_shexChunk->programInfo().type() != DxbcProgramType::VertexShader)
+      throw DxvkError("DxbcModule::compileFusedGs: Invalid shader types");
+
+    if (gsInfo.xfb != nullptr || vsInfo.xfb != nullptr)
+      throw DxvkError("DxbcModule::compileFusedGs: Stream output not supported");
+
+    // Compile the vertex shader into the shared module first
+    DxbcAnalysisInfo vsAnalysis;
+
+    DxbcAnalyzer vsAnalyzer(vsInfo,
+      vsModule.m_shexChunk->programInfo(),
+      vsModule.m_isgnChunk, vsModule.m_osgnChunk,
+      vsModule.m_psgnChunk, vsAnalysis);
+
+    vsModule.runAnalyzer(vsAnalyzer, vsModule.m_shexChunk->slice());
+
+    DxbcCompiler vsCompiler(
+      fileName + "_vs", vsInfo,
+      vsModule.m_shexChunk->programInfo(),
+      vsModule.m_isgnChunk, vsModule.m_osgnChunk,
+      vsModule.m_psgnChunk, vsAnalysis,
+      DxbcFusedMode::VsPart, nullptr);
+
+    vsModule.runCompiler(vsCompiler, vsModule.m_shexChunk->slice());
+
+    // Now compile the geometry shader into the same module
+    DxbcAnalysisInfo gsAnalysis;
+
+    DxbcAnalyzer gsAnalyzer(gsInfo,
+      m_shexChunk->programInfo(),
+      m_isgnChunk, m_osgnChunk,
+      m_psgnChunk, gsAnalysis);
+
+    this->runAnalyzer(gsAnalyzer, m_shexChunk->slice());
+
+    DxbcCompiler gsCompiler(
+      fileName, gsInfo,
+      m_shexChunk->programInfo(),
+      m_isgnChunk, m_osgnChunk,
+      m_psgnChunk, gsAnalysis,
+      DxbcFusedMode::GsPart, &vsCompiler);
+
+    gsCompiler.setFusedCutCount(this->countEffectiveCuts(m_shexChunk->slice()));
+
+    this->runCompiler(gsCompiler, m_shexChunk->slice());
+
+    return gsCompiler.finalize();
+  }
+
+
+  uint32_t DxbcModule::countEffectiveCuts(DxbcCodeSlice slice) const {
+    // Cuts that are not followed by any further emit do not
+    // start a new strip. In shaders with loops, assume that
+    // every cut can be followed by an emit.
+    DxbcDecodeContext decoder;
+    uint32_t cuts = 0;
+    uint32_t effective = 0;
+    bool hasLoop = false;
+
+    while (!slice.atEnd()) {
+      decoder.decodeInstruction(slice);
+      const DxbcOpcode op = decoder.getInstruction().op;
+
+      if (op == DxbcOpcode::Loop)
+        hasLoop = true;
+
+      const bool isEmit = op == DxbcOpcode::Emit || op == DxbcOpcode::EmitStream
+        || op == DxbcOpcode::EmitThenCut || op == DxbcOpcode::EmitThenCutStream;
+      const bool isCut = op == DxbcOpcode::Cut || op == DxbcOpcode::CutStream
+        || op == DxbcOpcode::EmitThenCut || op == DxbcOpcode::EmitThenCutStream;
+
+      // A plain emit makes all previous cuts effective
+      if (op == DxbcOpcode::Emit || op == DxbcOpcode::EmitStream)
+        effective = cuts;
+      else if (isEmit)
+        effective = cuts;
+
+      if (isCut)
+        cuts += 1;
+    }
+
+    return hasLoop ? cuts : effective;
+  }
+
+
   void DxbcModule::runAnalyzer(
           DxbcAnalyzer&       analyzer,
           DxbcCodeSlice       slice) const {

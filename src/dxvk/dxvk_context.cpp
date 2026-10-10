@@ -1,12 +1,98 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 
+#include "../util/util_env.h"
+
 namespace dxvk {
-  
+
+  namespace {
+
+    void warnGsEmulationUnsupported(const char* what) {
+      static std::atomic<uint32_t> counter = { 0 };
+      uint32_t n = counter.fetch_add(1);
+
+      if (n < 20)
+        Logger::warn(str::format("GS emulation: ", what, " not supported yet, skipping draw"));
+    }
+
+    /**
+     * Diagnostics for draws that use a geometry shader. Enabled with
+     * DXVK_LOG_GS_DRAWS=1. Prints a summary of all draws that had a
+     * geometry shader bound every few seconds, so that it can be told
+     * which geometry shaders actually matter for what is on screen.
+     */
+    struct GsDrawStats {
+      std::string         vs;
+      std::string         fs;
+      VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+      uint64_t            draws    = 0;
+      uint64_t            indexed  = 0;
+      uint64_t            elements = 0;
+      uint64_t            maxElems = 0;
+      uint64_t            instances = 0;
+      uint64_t            maxInstances = 0;
+    };
+
+    std::mutex                                 g_gsStatsMutex;
+    std::unordered_map<std::string, GsDrawStats> g_gsStats;
+    std::chrono::steady_clock::time_point      g_gsStatsLastDump = std::chrono::steady_clock::now();
+
+    void logGsDraw(
+      const DxvkGraphicsPipelineShaders&  shaders,
+            VkPrimitiveTopology           topology,
+            bool                          indexed,
+            uint32_t                      elements,
+            uint32_t                      instances) {
+      static const bool enabled = env::getEnvVar("DXVK_LOG_GS_DRAWS") == "1";
+
+      if (!enabled || shaders.gs == nullptr)
+        return;
+
+      std::lock_guard<std::mutex> lock(g_gsStatsMutex);
+
+      GsDrawStats& s = g_gsStats[shaders.gs->debugName()];
+      s.vs        = shaders.vs != nullptr ? shaders.vs->debugName() : "-";
+      s.fs        = shaders.fs != nullptr ? shaders.fs->debugName() : "-";
+      s.topology  = topology;
+      s.draws    += 1;
+      s.indexed  += indexed ? 1 : 0;
+      s.elements += elements;
+      s.maxElems  = std::max<uint64_t>(s.maxElems, elements);
+      s.instances += instances;
+      s.maxInstances = std::max<uint64_t>(s.maxInstances, instances);
+
+      auto now = std::chrono::steady_clock::now();
+
+      if (now - g_gsStatsLastDump >= std::chrono::seconds(5)) {
+        g_gsStatsLastDump = now;
+
+        for (const auto& e : g_gsStats) {
+          const GsDrawStats& v = e.second;
+
+          Logger::info(str::format("GS-DRAWSTAT (5s): ", e.first,
+            "  vs=", v.vs, "  fs=", v.fs,
+            "  topology=", uint32_t(v.topology),
+            "  draws=", v.draws, " (indexed ", v.indexed, ")",
+            "  elements=", v.elements, " (max/draw ", v.maxElems, ")",
+            "  instances=", v.instances, " (max/draw ", v.maxInstances, ")"));
+        }
+
+        g_gsStats.clear();
+      }
+    }
+
+  }
+
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
   : m_device      (device),
     m_common      (&device->m_objects),
@@ -1390,10 +1476,23 @@ namespace dxvk {
           uint32_t instanceCount,
           uint32_t firstVertex,
           uint32_t firstInstance) {
+    logGsDraw(m_state.gp.shaders, m_state.gp.state.ia.primitiveTopology(),
+      false, vertexCount, instanceCount);
+
     if (this->commitGraphicsState<false, false>()) {
-      m_cmd->cmdDraw(
-        vertexCount, instanceCount,
-        firstVertex, firstInstance);
+      if (m_gpGsEmuVertices) {
+        if (instanceCount == 1 && m_state.gp.state.ia.primitiveTopology() == VK_PRIMITIVE_TOPOLOGY_POINT_LIST) {
+          // Draw one instance per point, the instance base is
+          // the first vertex so that vertex fetch is unchanged.
+          m_cmd->cmdDraw(m_gpGsEmuVertices, vertexCount, 0, firstVertex);
+        } else {
+          warnGsEmulationUnsupported("instanced or non-point-list draw");
+        }
+      } else {
+        m_cmd->cmdDraw(
+          vertexCount, instanceCount,
+          firstVertex, firstInstance);
+      }
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1404,13 +1503,21 @@ namespace dxvk {
           VkDeviceSize      offset,
           uint32_t          count,
           uint32_t          stride) {
+    // Element counts are unknown for indirect draws, log the draw count instead
+    logGsDraw(m_state.gp.shaders, m_state.gp.state.ia.primitiveTopology(),
+      false, 0, count);
+
     if (this->commitGraphicsState<false, true>()) {
-      auto descriptor = m_state.id.argBuffer.getDescriptor();
-      
-      m_cmd->cmdDrawIndirect(
-        descriptor.buffer.buffer,
-        descriptor.buffer.offset + offset,
-        count, stride);
+      if (m_gpGsEmuVertices) {
+        warnGsEmulationUnsupported("indirect draw");
+      } else {
+        auto descriptor = m_state.id.argBuffer.getDescriptor();
+
+        m_cmd->cmdDrawIndirect(
+          descriptor.buffer.buffer,
+          descriptor.buffer.offset + offset,
+          count, stride);
+      }
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1422,7 +1529,7 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
-    if (this->commitGraphicsState<false, true>()) {
+    if (this->commitGraphicsState<false, true>() && !m_gpGsEmuVertices) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
       
@@ -1444,28 +1551,115 @@ namespace dxvk {
           uint32_t firstIndex,
           uint32_t vertexOffset,
           uint32_t firstInstance) {
+    logGsDraw(m_state.gp.shaders, m_state.gp.state.ia.primitiveTopology(),
+      true, indexCount, instanceCount);
+
     if (this->commitGraphicsState<true, false>()) {
-      m_cmd->cmdDrawIndexed(
-        indexCount, instanceCount,
-        firstIndex, vertexOffset,
-        firstInstance);
+      if (m_gpGsEmuVertices) {
+        this->drawIndexedGsEmulated(indexCount, instanceCount, firstIndex, vertexOffset);
+      } else {
+        m_cmd->cmdDrawIndexed(
+          indexCount, instanceCount,
+          firstIndex, vertexOffset,
+          firstInstance);
+      }
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
   }
   
   
+  void DxvkContext::drawIndexedGsEmulated(
+          uint32_t indexCount,
+          uint32_t instanceCount,
+          uint32_t firstIndex,
+          uint32_t vertexOffset) {
+    if (instanceCount != 1 || m_state.gp.state.ia.primitiveTopology() != VK_PRIMITIVE_TOPOLOGY_POINT_LIST) {
+      warnGsEmulationUnsupported("instanced or non-point-list indexed draw");
+      return;
+    }
+
+    // The index buffer has to be read on the CPU: Each run of consecutive
+    // vertex indices becomes one instanced draw where the instance index
+    // selects the point, see draw().
+    const DxvkBufferSlice& slice = m_state.vi.indexBuffer;
+
+    if (!slice.defined() || slice.buffer()->mapPtr(0) == nullptr) {
+      warnGsEmulationUnsupported("indexed draw with non-mappable index buffer");
+      return;
+    }
+
+    const bool is16 = m_state.vi.indexType == VK_INDEX_TYPE_UINT16;
+    const uint32_t indexSize = is16 ? 2u : 4u;
+    const char* data = reinterpret_cast<const char*>(slice.mapPtr(0));
+
+    if ((uint64_t(firstIndex) + indexCount) * indexSize > slice.length()) {
+      warnGsEmulationUnsupported("indexed draw out of index buffer bounds");
+      return;
+    }
+
+    const uint32_t restart = is16 ? 0xffffu : 0xffffffffu;
+    bool     inRun    = false;
+    uint32_t runStart = 0;
+    uint32_t runLen   = 0;
+
+    auto flush = [&] {
+      if (runLen)
+        m_cmd->cmdDraw(m_gpGsEmuVertices, runLen, 0, runStart);
+      runLen = 0;
+      inRun = false;
+    };
+
+    for (uint32_t i = 0; i < indexCount; i++) {
+      uint32_t idx;
+
+      if (is16) {
+        uint16_t v;
+        std::memcpy(&v, data + size_t(firstIndex + i) * 2, 2);
+        idx = v;
+      } else {
+        std::memcpy(&idx, data + size_t(firstIndex + i) * 4, 4);
+      }
+
+      if (idx == restart) {
+        flush();
+        continue;
+      }
+
+      const uint32_t vertex = idx + vertexOffset;
+
+      if (inRun && vertex == runStart + runLen) {
+        runLen += 1;
+      } else {
+        flush();
+        runStart = vertex;
+        runLen = 1;
+        inRun = true;
+      }
+    }
+
+    flush();
+  }
+
+
   void DxvkContext::drawIndexedIndirect(
           VkDeviceSize      offset,
           uint32_t          count,
           uint32_t          stride) {
+    logGsDraw(m_state.gp.shaders, m_state.gp.state.ia.primitiveTopology(),
+      true, 0, count);
+
     if (this->commitGraphicsState<true, true>()) {
-      auto descriptor = m_state.id.argBuffer.getDescriptor();
-      
-      m_cmd->cmdDrawIndexedIndirect(
-        descriptor.buffer.buffer,
-        descriptor.buffer.offset + offset,
-        count, stride);
+      if (m_gpGsEmuVertices) {
+        warnGsEmulationUnsupported("indexed indirect draw");
+      } else {
+        auto descriptor = m_state.id.argBuffer.getDescriptor();
+
+        m_cmd->cmdDrawIndexedIndirect(
+          descriptor.buffer.buffer,
+          descriptor.buffer.offset + offset,
+          count, stride);
+      }
     }
     
     m_cmd->addStatCtr(DxvkStatCounter::CmdDrawCalls, 1);
@@ -1477,7 +1671,7 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
-    if (this->commitGraphicsState<true, true>()) {
+    if (this->commitGraphicsState<true, true>() && !m_gpGsEmuVertices) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
       
@@ -4086,7 +4280,24 @@ namespace dxvk {
   
   
   bool DxvkContext::updateGraphicsPipeline() {
-    m_state.gp.pipeline = lookupGraphicsPipeline(m_state.gp.shaders);
+    DxvkGraphicsPipelineShaders shaders = m_state.gp.shaders;
+    m_gpGsEmuVertices = 0;
+
+    // If the device cannot run geometry shaders, try to emulate them
+    // using a vertex shader that runs once per vertex that the geometry
+    // shader can emit, and once per input point.
+    if (shaders.gs != nullptr && !m_device->features().core.features.geometryShader
+     && shaders.tcs == nullptr && shaders.tes == nullptr) {
+      Rc<DxvkShader> fused = shaders.gs->getFusedVertexShader(shaders.vs);
+
+      if (fused != nullptr) {
+        m_gpGsEmuVertices = fused->info().gsEmuVertexCount;
+        shaders.vs = std::move(fused);
+        shaders.gs = nullptr;
+      }
+    }
+
+    m_state.gp.pipeline = lookupGraphicsPipeline(shaders);
 
     if (unlikely(m_state.gp.pipeline == nullptr)) {
       m_state.gp.flags = DxvkGraphicsPipelineFlags();
@@ -4147,8 +4358,29 @@ namespace dxvk {
       : DxvkContextFlag::GpDirtyStencilRef);
     
     // Retrieve and bind actual Vulkan pipeline handle
+    const DxvkGraphicsPipelineStateInfo* pipelineState = &m_state.gp.state;
+    DxvkGraphicsPipelineStateInfo emulatedState;
+
+    if (m_gpGsEmuVertices) {
+      // Each input point is drawn as one instance, and each instance
+      // produces a triangle strip. Vertex data is fetched per instance.
+      emulatedState = m_state.gp.state;
+      emulatedState.ia = DxvkIaInfo(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_TRUE, 0);
+
+      for (uint32_t i = 0; i < emulatedState.il.bindingCount(); i++) {
+        const DxvkIlBinding& b = m_state.gp.state.ilBindings[i];
+
+        if (b.inputRate() == VK_VERTEX_INPUT_RATE_VERTEX) {
+          emulatedState.ilBindings[i] = DxvkIlBinding(
+            b.binding(), b.stride(), VK_VERTEX_INPUT_RATE_INSTANCE, 1);
+        }
+      }
+
+      pipelineState = &emulatedState;
+    }
+
     m_gpActivePipeline = m_state.gp.pipeline->getPipelineHandle(
-      m_state.gp.state, m_state.om.framebufferInfo.renderPass(), this->checkAsyncCompilationCompat());
+      *pipelineState, m_state.om.framebufferInfo.renderPass(), this->checkAsyncCompilationCompat());
 
     if (unlikely(!m_gpActivePipeline))
       return false;

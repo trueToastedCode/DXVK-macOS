@@ -152,6 +152,16 @@ namespace dxvk {
   /**
    * \brief Geometry shader-specific structure
    */
+  /**
+   * \brief Fusion mode for geometry shader emulation
+   */
+  enum class DxbcFusedMode : uint32_t {
+    None   = 0,
+    VsPart = 1,
+    GsPart = 2,
+  };
+
+
   struct DxbcCompilerGsPart {
     DxbcPrimitive         inputPrimitive      = DxbcPrimitive::Undefined;
     DxbcPrimitiveTopology outputTopology      = DxbcPrimitiveTopology::Undefined;
@@ -384,8 +394,20 @@ namespace dxvk {
       const Rc<DxbcIsgn>&       isgn,
       const Rc<DxbcIsgn>&       osgn,
       const Rc<DxbcIsgn>&       psgn,
-      const DxbcAnalysisInfo&   analysis);
+      const DxbcAnalysisInfo&   analysis,
+            DxbcFusedMode       fusedMode = DxbcFusedMode::None,
+            DxbcCompiler*       vsPart    = nullptr);
     ~DxbcCompiler();
+
+    /**
+     * \brief Sets number of cut instructions to emulate
+     *
+     * Only for geometry shaders in fused mode. Cuts after
+     * this many cut instructions are ignored.
+     */
+    void setFusedCutCount(uint32_t cuts) {
+      m_fusedCuts = cuts;
+    }
     
     /**
      * \brief Processes a single instruction
@@ -413,7 +435,29 @@ namespace dxvk {
     
     DxbcModuleInfo      m_moduleInfo;
     DxbcProgramInfo     m_programInfo;
-    SpirvModule         m_module;
+    SpirvModule         m_ownModule;
+    SpirvModule&        m_module;
+
+    ///////////////////////////////////////////////////////////
+    // Geometry shader emulation: A vertex shader and a point
+    // list geometry shader are compiled into one vertex shader
+    // that is invoked once per output vertex of the geometry
+    // shader (vertex index) and once per input point (instance).
+    DxbcFusedMode       m_fusedMode = DxbcFusedMode::None;
+    DxbcCompiler*       m_vsPart    = nullptr;
+
+    struct DxbcFusedOutput {
+      uint32_t        srcId;
+      uint32_t        dstId;
+      DxbcVectorType  type;
+    };
+
+    std::vector<DxbcFusedOutput> m_fusedOutputs;
+    uint32_t m_fusedEmitCounter = 0;
+    uint32_t m_fusedCornerId    = 0;
+    uint32_t m_fusedCuts        = 0;   // number of cuts that have to be emulated
+    uint32_t m_fusedCutIndex    = 0;   // index of the next cut instruction
+    uint32_t m_fusedPending     = 0;   // private variable, set after a cut
     
     Rc<DxbcIsgn>        m_isgn;
     Rc<DxbcIsgn>        m_osgn;
@@ -1124,6 +1168,15 @@ namespace dxvk {
     void emitHsFinalize();
     void emitDsFinalize();
     void emitGsFinalize();
+
+    void emitFusedGsFinalize();
+    void emitFusedCopyOutputs();
+    void emitFusedLinkInputs();
+    void emitFusedEmit(bool doEmit, bool doCut);
+    uint32_t emitFusedPointIndex();
+    DxbcRegisterValue emitFusedPositionLoad(
+            DxbcSystemValue         sv,
+            DxbcRegMask             mask);
     void emitPsFinalize();
     void emitCsFinalize();
 

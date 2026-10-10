@@ -101,6 +101,11 @@ namespace dxvk {
     if (!this->validatePipelineState(state, false))
       return false;
 
+    // Geometry shaders are emulated by a fused vertex shader on devices
+    // that do not support them, so do not try to compile the real thing.
+    if (m_shaders.gs != nullptr && !m_pipeMgr->m_device->features().core.features.geometryShader)
+      return false;
+
     // Keep the object locked while compiling a pipeline since compiling
     // similar pipelines concurrently is fragile on some drivers
     std::lock_guard<dxvk::mutex> lock(m_mutex);

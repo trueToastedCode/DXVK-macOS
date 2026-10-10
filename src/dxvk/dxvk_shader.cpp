@@ -60,6 +60,30 @@ namespace dxvk {
   }
 
 
+  Rc<DxvkShader> DxvkShader::getFusedVertexShader(const Rc<DxvkShader>& vs) {
+    if (!m_gsFusion || vs == nullptr)
+      return nullptr;
+
+    std::lock_guard<dxvk::mutex> lock(m_fusionMutex);
+
+    auto entry = m_fusionCache.find(vs.ptr());
+
+    if (entry != m_fusionCache.end())
+      return entry->second.second;
+
+    Rc<DxvkShader> fused;
+
+    try {
+      fused = m_gsFusion(vs);
+    } catch (const DxvkError& e) {
+      Logger::err(str::format("GS emulation failed for ", debugName(), ": ", e.message()));
+    }
+
+    m_fusionCache.insert({ vs.ptr(), { vs, fused } });
+    return fused;
+  }
+
+
   DxvkShader::DxvkShader(
     const DxvkShaderCreateInfo&   info,
           SpirvCodeBuffer&&       spirv)

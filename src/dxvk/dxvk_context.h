@@ -587,6 +587,12 @@ namespace dxvk {
      * \param [in] count Number of draws
      * \param [in] stride Stride between dispatch calls
      */
+    void drawIndexedGsEmulated(
+            uint32_t          indexCount,
+            uint32_t          instanceCount,
+            uint32_t          firstIndex,
+            uint32_t          vertexOffset);
+
     void drawIndexedIndirect(
             VkDeviceSize      offset,
             uint32_t          count,
@@ -1076,6 +1082,10 @@ namespace dxvk {
     DxvkRenderTargetLayouts m_rtLayouts = { };
 
     VkPipeline m_gpActivePipeline = VK_NULL_HANDLE;
+
+    // Number of vertices emitted per point by an emulated geometry
+    // shader, or 0 if the active graphics pipeline is not emulated.
+    uint32_t m_gpGsEmuVertices = 0;
     VkPipeline m_cpActivePipeline = VK_NULL_HANDLE;
 
     VkDescriptorSet m_gpSet = VK_NULL_HANDLE;

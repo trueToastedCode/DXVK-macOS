@@ -1,11 +1,15 @@
 #pragma once
 
+#include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include "dxvk_include.h"
 #include "dxvk_limits.h"
 #include "dxvk_pipelayout.h"
 #include "dxvk_shader_key.h"
+
+#include "../util/thread.h"
 
 #include "../spirv/spirv_code_buffer.h"
 #include "../spirv/spirv_compression.h"
@@ -71,6 +75,9 @@ namespace dxvk {
     int32_t xfbRasterizedStream = 0;
     /// Transform feedback vertex strides
     uint32_t xfbStrides[MaxNumXfbBuffers] = { };
+    /// Number of vertices per input point if this shader is
+    /// a vertex shader fused with an emulated geometry shader
+    uint32_t gsEmuVertexCount = 0;
   };
 
 
@@ -197,8 +204,52 @@ namespace dxvk {
     static size_t getHash(const Rc<DxvkShader>& shader) {
       return shader != nullptr ? shader->getHash() : 0;
     }
+
+    /**
+     * \brief Sets opaque data used to recompile the shader
+     * \param [in] source Source object, owned by the front-end
+     */
+    void setSource(Rc<RcObject> source) {
+      m_source = std::move(source);
+    }
+
+    /**
+     * \brief Retrieves source object
+     * \returns Opaque source object set by the front-end
+     */
+    Rc<RcObject> source() const {
+      return m_source;
+    }
+
+    /**
+     * \brief Geometry shader fusion callback
+     *
+     * Creates a vertex shader that includes the given vertex shader
+     * and emulates this geometry shader. May return \c nullptr.
+     */
+    using GsFusionFn = std::function<Rc<DxvkShader>(const Rc<DxvkShader>&)>;
+
+    void setGsFusion(GsFusionFn&& fn) {
+      m_gsFusion = std::move(fn);
+    }
+
+    /**
+     * \brief Retrieves emulated geometry shader
+     *
+     * If this is a geometry shader, this will return a vertex shader
+     * that runs the given vertex shader and this geometry shader, or
+     * \c nullptr if the shader cannot be emulated. Results are cached.
+     * \param [in] vs The vertex shader that feeds this geometry shader
+     */
+    Rc<DxvkShader> getFusedVertexShader(const Rc<DxvkShader>& vs);
     
   private:
+
+    Rc<RcObject>                  m_source;
+    GsFusionFn                    m_gsFusion;
+
+    dxvk::mutex                   m_fusionMutex;
+    std::unordered_map<DxvkShader*, std::pair<Rc<DxvkShader>, Rc<DxvkShader>>> m_fusionCache;
     
     DxvkShaderCreateInfo          m_info;
     SpirvCompressedBuffer         m_code;

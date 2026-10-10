@@ -318,6 +318,21 @@ namespace dxvk {
       enabledFeatures.khrBufferDeviceAddress.bufferDeviceAddress = VK_TRUE;
     }
 
+    // Allow turning off VK_EXT_transform_feedback via DXVK_DISABLE_XFB=1.
+    // Some MoltenVK builds emulate it with Metal mesh shaders, which can
+    // break the shader compilation of unrelated vertex shaders. Disabling
+    // it only affects D3D11 stream output (geometry shaders with SO).
+    {
+      std::string disableXfb = env::getEnvVar("DXVK_DISABLE_XFB");
+
+      if (!disableXfb.empty() && disableXfb != "0") {
+        Logger::info("DxvkAdapter: VK_EXT_transform_feedback disabled via DXVK_DISABLE_XFB");
+        devExtensions.extTransformFeedback.setMode(DxvkExtMode::Disabled);
+        enabledFeatures.extTransformFeedback.transformFeedback = VK_FALSE;
+        enabledFeatures.extTransformFeedback.geometryStreams   = VK_FALSE;
+      }
+    }
+
     DxvkNameSet extensionsEnabled;
 
     if (!m_deviceExtensions.enableExtensions(

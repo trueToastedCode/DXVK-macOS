@@ -44,6 +44,53 @@ namespace dxvk {
       ? module.compilePassthroughShader(*pDxbcModuleInfo, name)
       : module.compile                 (*pDxbcModuleInfo, name);
     m_shader->setShaderKey(*pShaderKey);
+
+    // Keep the byte code around so that vertex shaders can be combined
+    // with geometry shaders if the device cannot run geometry shaders.
+    const DxbcProgramType programType = module.programInfo().type();
+
+    if (!passthroughShader && (programType == DxbcProgramType::VertexShader
+     || programType == DxbcProgramType::GeometryShader)) {
+      Rc<DxbcShaderSource> source = new DxbcShaderSource(
+        pShaderBytecode, BytecodeLength, *pDxbcModuleInfo);
+      m_shader->setSource(source);
+
+      if (programType == DxbcProgramType::GeometryShader && !source->hasXfb()) {
+        m_shader->setGsFusion([source, name, dumpPath] (const Rc<DxvkShader>& vs) -> Rc<DxvkShader> {
+          Rc<DxbcShaderSource> vsSource = static_cast<DxbcShaderSource*>(vs->source().ptr());
+
+          if (vsSource == nullptr || vsSource->hasXfb()
+           || vs->info().stage != VK_SHADER_STAGE_VERTEX_BIT)
+            return nullptr;
+
+          DxbcReader vsReader(vsSource->code().data(), vsSource->code().size());
+          DxbcReader gsReader(source->code().data(), source->code().size());
+
+          DxbcModule vsModule(vsReader);
+          DxbcModule gsModule(gsReader);
+
+          const std::string fusedName = str::format(
+            "GSEMU_", vs->getShaderKey().toString(), "_", name);
+
+          Rc<DxvkShader> fused = gsModule.compileFusedGs(vsModule,
+            vsSource->moduleInfo(), source->moduleInfo(), fusedName);
+
+          fused->setShaderKey(DxvkShaderKey(VK_SHADER_STAGE_VERTEX_BIT,
+            Sha1Hash::compute(fusedName.data(), fusedName.size())));
+
+          if (!dumpPath.empty()) {
+            std::ofstream dumpStream(
+              str::tows(str::format(dumpPath, "/", fusedName, ".spv").c_str()).c_str(),
+              std::ios_base::binary | std::ios_base::trunc);
+            fused->dump(dumpStream);
+          }
+
+          Logger::info(str::format("GS emulation: ", fusedName,
+            " (", fused->info().gsEmuVertexCount, " vertices per point)"));
+          return fused;
+        });
+      }
+    }
     
     if (dumpPath.size() != 0) {
       std::ofstream dumpStream(

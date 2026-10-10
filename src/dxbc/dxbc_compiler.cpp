@@ -16,10 +16,16 @@ namespace dxvk {
     const Rc<DxbcIsgn>&       isgn,
     const Rc<DxbcIsgn>&       osgn,
     const Rc<DxbcIsgn>&       psgn,
-    const DxbcAnalysisInfo&   analysis)
+    const DxbcAnalysisInfo&   analysis,
+          DxbcFusedMode       fusedMode,
+          DxbcCompiler*       vsPart)
   : m_moduleInfo (moduleInfo),
     m_programInfo(programInfo),
-    m_module     (spvVersion(1, 3)),
+    m_ownModule  (spvVersion(1, 3)),
+    m_module     (fusedMode == DxbcFusedMode::GsPart && vsPart
+                    ? vsPart->m_module : m_ownModule),
+    m_fusedMode  (fusedMode),
+    m_vsPart     (vsPart),
     m_isgn       (isgn),
     m_osgn       (osgn),
     m_psgn       (psgn),
@@ -229,6 +235,8 @@ namespace dxvk {
   
   
   Rc<DxvkShader> DxbcCompiler::finalize() {
+    const bool fusedGs = m_fusedMode == DxbcFusedMode::GsPart;
+
     // Depending on the shader type, this will prepare
     // input registers, call various shader functions
     // and write back the output registers.
@@ -236,7 +244,10 @@ namespace dxvk {
       case DxbcProgramType::VertexShader:   this->emitVsFinalize(); break;
       case DxbcProgramType::HullShader:     this->emitHsFinalize(); break;
       case DxbcProgramType::DomainShader:   this->emitDsFinalize(); break;
-      case DxbcProgramType::GeometryShader: this->emitGsFinalize(); break;
+      case DxbcProgramType::GeometryShader:
+        if (fusedGs) this->emitFusedGsFinalize();
+        else         this->emitGsFinalize();
+        break;
       case DxbcProgramType::PixelShader:    this->emitPsFinalize(); break;
       case DxbcProgramType::ComputeShader:  this->emitCsFinalize(); break;
     }
@@ -247,7 +258,7 @@ namespace dxvk {
     // Declare the entry point, we now have all the
     // information we need, including the interfaces
     m_module.addEntryPoint(m_entryPointId,
-      m_programInfo.executionModel(), "main",
+      fusedGs ? spv::ExecutionModelVertex : m_programInfo.executionModel(), "main",
       m_entryPointInterfaces.size(),
       m_entryPointInterfaces.data());
     m_module.setDebugName(m_entryPointId, "main");
@@ -261,6 +272,24 @@ namespace dxvk {
     info.outputMask = m_outputMask;
     info.uniformSize = m_immConstData.size();
     info.uniformData = m_immConstData.data();
+
+    std::vector<DxvkResourceSlot> fusedSlots;
+
+    if (fusedGs) {
+      // Fused shader runs in the vertex stage and uses the
+      // resources of both the vertex and the geometry shader.
+      info.stage = VK_SHADER_STAGE_VERTEX_BIT;
+      info.inputMask = m_vsPart->m_inputMask;
+      info.gsEmuVertexCount = m_gs.outputVertexCount + 3 * m_fusedCuts;
+      info.uniformSize = 0;
+      info.uniformData = nullptr;
+
+      fusedSlots = m_vsPart->m_resourceSlots;
+      fusedSlots.insert(fusedSlots.end(),
+        m_resourceSlots.begin(), m_resourceSlots.end());
+      info.resourceSlotCount = fusedSlots.size();
+      info.resourceSlots = fusedSlots.data();
+    }
 
     if (m_moduleInfo.xfb) {
       info.xfbRasterizedStream = m_moduleInfo.xfb->rasterizedStream;
@@ -585,11 +614,20 @@ namespace dxvk {
       } break;
       
       case DxbcOperandType::InputPrimitiveId: {
-        m_primitiveIdIn = emitNewBuiltinVariable({
-          { DxbcScalarType::Uint32, 1, 0 },
-          spv::StorageClassInput },
-          spv::BuiltInPrimitiveId,
-          "vPrim");
+        if (m_fusedMode == DxbcFusedMode::GsPart) {
+          // No primitive ID in vertex shaders, this is
+          // initialized with the point index in main()
+          m_primitiveIdIn = emitNewVariable({
+            { DxbcScalarType::Uint32, 1, 0 },
+            spv::StorageClassPrivate });
+          m_module.setDebugName(m_primitiveIdIn, "vPrim");
+        } else {
+          m_primitiveIdIn = emitNewBuiltinVariable({
+            { DxbcScalarType::Uint32, 1, 0 },
+            spv::StorageClassInput },
+            spv::BuiltInPrimitiveId,
+            "vPrim");
+        }
       } break;
       
       case DxbcOperandType::InputDomainPoint: {
@@ -661,12 +699,23 @@ namespace dxvk {
       info.type.ccount  = regType.ccount;
       info.type.alength = regDim;
       info.sclass = spv::StorageClassInput;
+
+      // Inputs of an emulated geometry shader are copied
+      // from the output registers of the vertex shader
+      const bool fusedInput = m_fusedMode == DxbcFusedMode::GsPart;
+
+      if (fusedInput)
+        info.sclass = spv::StorageClassPrivate;
       
       const uint32_t varId = emitNewVariable(info);
       
-      m_module.decorateLocation(varId, regIdx);
+      if (!fusedInput)
+        m_module.decorateLocation(varId, regIdx);
+
       m_module.setDebugName(varId, str::format("v", regIdx).c_str());
-      m_entryPointInterfaces.push_back(varId);
+
+      if (!fusedInput)
+        m_entryPointInterfaces.push_back(varId);
       
       m_vRegs.at(regIdx) = { regType, varId };
       
@@ -690,7 +739,9 @@ namespace dxvk {
       }
 
       // Declare the input slot as defined
-      m_inputMask |= 1u << regIdx;
+      if (m_fusedMode != DxbcFusedMode::GsPart)
+        m_inputMask |= 1u << regIdx;
+
       m_vArrayLength = std::max(m_vArrayLength, regIdx + 1);
     } else if (sv != DxbcSystemValue::None) {
       // Add a new system value mapping if needed
@@ -736,6 +787,11 @@ namespace dxvk {
       // output vars when emitting a vertex
       if (m_moduleInfo.xfb != nullptr)
         info.sclass = spv::StorageClassPrivate;
+
+      // The vertex shader part of an emulated geometry shader
+      // passes its outputs to the geometry shader via registers
+      if (m_fusedMode == DxbcFusedMode::VsPart)
+        info.sclass = spv::StorageClassPrivate;
       
       // In geometry shaders, don't duplicate system value outputs
       // to stay within device limits. The pixel shader will read
@@ -743,8 +799,29 @@ namespace dxvk {
       if (m_programInfo.type() == DxbcProgramType::GeometryShader && sv != DxbcSystemValue::None)
         info.sclass = spv::StorageClassPrivate;
 
+      // In emulated geometry shaders, the shader writes to private
+      // registers and the actual outputs are only written when a
+      // vertex is emitted for the current vertex index.
+      const bool fusedOutput = m_fusedMode == DxbcFusedMode::GsPart
+        && info.sclass == spv::StorageClassOutput;
+
+      if (fusedOutput)
+        info.sclass = spv::StorageClassPrivate;
+
       const uint32_t varId = this->emitNewVariable(info);
       m_module.setDebugName(varId, str::format("o", regIdx).c_str());
+
+      if (fusedOutput) {
+        DxbcRegisterInfo outInfo = info;
+        outInfo.sclass = spv::StorageClassOutput;
+
+        const uint32_t outId = this->emitNewVariable(outInfo);
+        m_module.setDebugName(outId, str::format("gs_out", regIdx).c_str());
+        m_module.decorateLocation(outId, regIdx);
+        m_entryPointInterfaces.push_back(outId);
+
+        m_fusedOutputs.push_back({ varId, outId, regType });
+      }
       
       if (info.sclass == spv::StorageClassOutput) {
         m_module.decorateLocation(varId, regIdx);
@@ -1283,13 +1360,22 @@ namespace dxvk {
     }();
     
     m_gs.inputPrimitive = ins.controls.primitive();
-    m_module.setExecutionMode(m_entryPointId, mode);
+
+    if (m_fusedMode == DxbcFusedMode::GsPart) {
+      // Only point lists can be emulated
+      if (m_gs.inputPrimitive != DxbcPrimitive::Point)
+        throw DxvkError("DxbcCompiler: GS emulation only supports point list input");
+    } else {
+      m_module.setExecutionMode(m_entryPointId, mode);
+    }
     
     const uint32_t vertexCount
       = primitiveVertexCount(m_gs.inputPrimitive);
     
     emitDclInputArray(vertexCount);
-    emitDclInputPerVertex(vertexCount, "gs_vertex_in");
+
+    if (m_fusedMode != DxbcFusedMode::GsPart)
+      emitDclInputPerVertex(vertexCount, "gs_vertex_in");
   }
   
   
@@ -1305,6 +1391,12 @@ namespace dxvk {
         default: throw DxvkError("DxbcCompiler: Unsupported primitive topology");
       }
     }();
+
+    if (m_fusedMode == DxbcFusedMode::GsPart) {
+      if (ins.controls.primitiveTopology() != DxbcPrimitiveTopology::TriangleStrip)
+        throw DxvkError("DxbcCompiler: GS emulation only supports triangle strip output");
+      return;
+    }
     
     m_module.setExecutionMode(m_entryPointId, mode);
   }
@@ -1314,6 +1406,9 @@ namespace dxvk {
     // dcl_max_output_vertex_count has one operand:
     //    (imm0) The maximum number of vertices
     m_gs.outputVertexCount = ins.imm[0].u32;
+
+    if (m_fusedMode == DxbcFusedMode::GsPart)
+      return;
     
     m_module.setOutputVertices(m_entryPointId, m_gs.outputVertexCount);
   }
@@ -1421,8 +1516,15 @@ namespace dxvk {
   void DxbcCompiler::emitDclGsInstanceCount(const DxbcShaderInstruction& ins) {
     // dcl_gs_instance_count has one operand:
     //    (imm0) Number of geometry shader invocations
-    m_module.setInvocations(m_entryPointId, ins.imm[0].u32);
     m_gs.invocationCount = ins.imm[0].u32;
+
+    if (m_fusedMode == DxbcFusedMode::GsPart) {
+      if (m_gs.invocationCount > 1)
+        throw DxvkError("DxbcCompiler: GS emulation does not support GS instancing");
+      return;
+    }
+
+    m_module.setInvocations(m_entryPointId, ins.imm[0].u32);
   }
   
   
@@ -2284,6 +2386,11 @@ namespace dxvk {
     // Checking the negation is easier for EmitThenCut/EmitThenCutStream
     bool doEmit = ins.op != DxbcOpcode::Cut && ins.op != DxbcOpcode::CutStream;
     bool doCut = ins.op != DxbcOpcode::Emit && ins.op != DxbcOpcode::EmitStream;
+
+    if (m_fusedMode == DxbcFusedMode::GsPart) {
+      emitFusedEmit(doEmit, doCut);
+      return;
+    }
 
     if (doEmit) {
       if (m_perVertexOut)
@@ -5880,7 +5987,9 @@ namespace dxvk {
           DxbcRegisterPointer srcPtr;
           srcPtr.type = m_vRegs.at(i).type;
           srcPtr.id = m_module.opAccessChain(
-            m_module.defPointerType(getVectorTypeId(srcPtr.type), spv::StorageClassInput),
+            m_module.defPointerType(getVectorTypeId(srcPtr.type),
+              m_fusedMode == DxbcFusedMode::GsPart
+                ? spv::StorageClassPrivate : spv::StorageClassInput),
             m_vRegs.at(i).id, 1, indices.data());
           
           DxbcRegisterValue srcValue = emitRegisterBitcast(
@@ -5904,7 +6013,10 @@ namespace dxvk {
       for (uint32_t v = 0; v < vertexCount; v++) {
         const DxbcRegisterValue value = [&] {
           switch (m_programInfo.type()) {
-            case DxbcProgramType::GeometryShader: return emitGsSystemValueLoad(map.sv, map.regMask, v);
+            case DxbcProgramType::GeometryShader:
+              if (m_fusedMode == DxbcFusedMode::GsPart)
+                return emitFusedPositionLoad(map.sv, map.regMask);
+              return emitGsSystemValueLoad(map.sv, map.regMask, v);
             default: throw DxvkError(str::format("DxbcCompiler: Unexpected stage: ", m_programInfo.type()));
           }
         }();
@@ -6113,6 +6225,22 @@ namespace dxvk {
   DxbcRegisterValue DxbcCompiler::emitVsSystemValueLoad(
           DxbcSystemValue         sv,
           DxbcRegMask             mask) {
+    if (m_fusedMode == DxbcFusedMode::VsPart) {
+      // The point index is the instance index, the vertex index
+      // is the index of the emitted vertex within the primitive.
+      DxbcRegisterValue result;
+      result.type.ctype   = DxbcScalarType::Uint32;
+      result.type.ccount  = 1;
+
+      if (sv == DxbcSystemValue::VertexId) {
+        result.id = emitFusedPointIndex();
+        return result;
+      } else if (sv == DxbcSystemValue::InstanceId) {
+        result.id = m_module.constu32(0);
+        return result;
+      }
+    }
+
     switch (sv) {
       case DxbcSystemValue::VertexId: {
         const uint32_t typeId = getScalarTypeId(DxbcScalarType::Uint32);
@@ -6502,6 +6630,10 @@ namespace dxvk {
         break;
       
       case DxbcSystemValue::PrimitiveId: {
+        // Not available as a vertex shader output
+        if (m_fusedMode == DxbcFusedMode::GsPart)
+          break;
+
         if (m_primitiveIdOut == 0) {
           m_primitiveIdOut = emitNewBuiltinVariable({
             { DxbcScalarType::Uint32, 1, 0 },
@@ -6730,28 +6862,36 @@ namespace dxvk {
     
     // Declare the per-vertex output block. This is where
     // the vertex shader will write the vertex position.
-    const uint32_t perVertexStruct = this->getPerVertexBlockId();
-    const uint32_t perVertexPointer = m_module.defPointerType(
-      perVertexStruct, spv::StorageClassOutput);
-    
-    m_perVertexOut = m_module.newVar(
-      perVertexPointer, spv::StorageClassOutput);
-    m_entryPointInterfaces.push_back(m_perVertexOut);
-    m_module.setDebugName(m_perVertexOut, "vs_vertex_out");
+    // Not needed if the outputs are consumed by an emulated
+    // geometry shader, which will declare its own outputs.
+    const bool fusedVs = m_fusedMode == DxbcFusedMode::VsPart;
+
+    if (!fusedVs) {
+      const uint32_t perVertexStruct = this->getPerVertexBlockId();
+      const uint32_t perVertexPointer = m_module.defPointerType(
+        perVertexStruct, spv::StorageClassOutput);
+      
+      m_perVertexOut = m_module.newVar(
+        perVertexPointer, spv::StorageClassOutput);
+      m_entryPointInterfaces.push_back(m_perVertexOut);
+      m_module.setDebugName(m_perVertexOut, "vs_vertex_out");
+    }
     
     // Standard input array
     emitDclInputArray(0);
     
     // Cull/clip distances as outputs
-    m_clipDistances = emitDclClipCullDistanceArray(
-      m_analysis->clipCullOut.numClipPlanes,
-      spv::BuiltInClipDistance,
-      spv::StorageClassOutput);
-    
-    m_cullDistances = emitDclClipCullDistanceArray(
-      m_analysis->clipCullOut.numCullPlanes,
-      spv::BuiltInCullDistance,
-      spv::StorageClassOutput);
+    if (!fusedVs) {
+      m_clipDistances = emitDclClipCullDistanceArray(
+        m_analysis->clipCullOut.numClipPlanes,
+        spv::BuiltInClipDistance,
+        spv::StorageClassOutput);
+      
+      m_cullDistances = emitDclClipCullDistanceArray(
+        m_analysis->clipCullOut.numCullPlanes,
+        spv::BuiltInCullDistance,
+        spv::StorageClassOutput);
+    }
     
     // Main function of the vertex shader
     m_vs.functionId = m_module.allocateId();
@@ -6826,7 +6966,8 @@ namespace dxvk {
   
   
   void DxbcCompiler::emitGsInit() {
-    m_module.enableCapability(spv::CapabilityGeometry);
+    if (m_fusedMode != DxbcFusedMode::GsPart)
+      m_module.enableCapability(spv::CapabilityGeometry);
     m_module.enableCapability(spv::CapabilityClipDistance);
     m_module.enableCapability(spv::CapabilityCullDistance);
 
@@ -6862,6 +7003,27 @@ namespace dxvk {
       m_analysis->clipCullOut.numCullPlanes,
       spv::BuiltInCullDistance,
       spv::StorageClassOutput);
+
+    if (m_fusedMode == DxbcFusedMode::GsPart) {
+      // The vertex index selects which emitted vertex this
+      // invocation outputs, the counter tracks emitted vertices.
+      m_fusedCornerId = emitNewBuiltinVariable({
+        { DxbcScalarType::Uint32, 1, 0 },
+        spv::StorageClassInput },
+        spv::BuiltInVertexIndex,
+        "gs_emu_vertex_index");
+
+      const uint32_t u32Type = getScalarTypeId(DxbcScalarType::Uint32);
+      m_fusedEmitCounter = m_module.newVarInit(
+        m_module.defPointerType(u32Type, spv::StorageClassPrivate),
+        spv::StorageClassPrivate, m_module.constu32(0));
+      m_module.setDebugName(m_fusedEmitCounter, "gs_emu_emit_count");
+
+      m_fusedPending = m_module.newVarInit(
+        m_module.defPointerType(u32Type, spv::StorageClassPrivate),
+        spv::StorageClassPrivate, m_module.constu32(0));
+      m_module.setDebugName(m_fusedPending, "gs_emu_pending_bridge");
+    }
     
     // Emit Xfb variables if necessary
     if (m_moduleInfo.xfb != nullptr)
@@ -7021,6 +7183,263 @@ namespace dxvk {
   }
   
   
+  uint32_t DxbcCompiler::emitFusedPointIndex() {
+    // Index of the input point, derived from the instance index
+    DxbcCompiler* vs = m_vsPart ? m_vsPart : this;
+    const uint32_t typeId = getScalarTypeId(DxbcScalarType::Uint32);
+
+    if (vs->m_vs.builtinInstanceId == 0) {
+      vs->m_vs.builtinInstanceId = vs->emitNewBuiltinVariable({
+        { DxbcScalarType::Uint32, 1, 0 },
+        spv::StorageClassInput },
+        spv::BuiltInInstanceIndex,
+        "vs_instance_index");
+    }
+
+    if (vs->m_vs.builtinBaseInstance == 0) {
+      vs->m_vs.builtinBaseInstance = vs->emitNewBuiltinVariable({
+        { DxbcScalarType::Uint32, 1, 0 },
+        spv::StorageClassInput },
+        spv::BuiltInBaseInstance,
+        "vs_base_instance");
+    }
+
+    return m_module.opISub(typeId,
+      m_module.opLoad(typeId, vs->m_vs.builtinInstanceId),
+      m_module.opLoad(typeId, vs->m_vs.builtinBaseInstance));
+  }
+
+
+  DxbcRegisterValue DxbcCompiler::emitFusedPositionLoad(
+          DxbcSystemValue         sv,
+          DxbcRegMask             mask) {
+    if (sv == DxbcSystemValue::Position && m_vsPart) {
+      for (const DxbcSvMapping& map : m_vsPart->m_oMappings) {
+        if (map.sv != sv)
+          continue;
+
+        DxbcRegisterValue value = emitRegisterBitcast(
+          emitValueLoad(m_vsPart->m_oRegs.at(map.regId)),
+          DxbcScalarType::Float32);
+        return emitRegisterExtract(value, mask);
+      }
+    }
+
+    throw DxvkError(str::format(
+      "DxbcCompiler: GS emulation: Unhandled GS SV input: ", sv));
+  }
+
+
+  void DxbcCompiler::emitFusedLinkInputs() {
+    // Copy vertex shader outputs to the geometry shader input
+    // registers. Only point lists are supported, so there is
+    // only one input vertex.
+    const uint32_t zero = m_module.consti32(0);
+
+    for (uint32_t i = 0; i < m_vRegs.size(); i++) {
+      if (m_vRegs.at(i).id == 0)
+        continue;
+
+      const DxbcRegisterPointer& vsOut = m_vsPart->m_oRegs.at(i);
+
+      if (vsOut.id == 0)
+        continue;
+
+      DxbcRegisterValue value = emitRegisterBitcast(
+        emitValueLoad(vsOut), m_vRegs.at(i).type.ctype);
+
+      DxbcRegisterPointer dstPtr;
+      dstPtr.type = m_vRegs.at(i).type;
+      dstPtr.id = m_module.opAccessChain(
+        m_module.defPointerType(getVectorTypeId(dstPtr.type),
+          spv::StorageClassPrivate),
+        m_vRegs.at(i).id, 1, &zero);
+
+      const uint32_t count = std::min(value.type.ccount, dstPtr.type.ccount);
+
+      if (value.type.ccount != count)
+        value = emitRegisterExtract(value, DxbcRegMask::firstN(count));
+
+      emitValueStore(dstPtr, value, DxbcRegMask::firstN(count));
+    }
+  }
+
+
+  void DxbcCompiler::emitFusedCopyOutputs() {
+    if (m_perVertexOut)
+      emitOutputSetup();
+
+    emitClipCullStore(DxbcSystemValue::ClipDistance, m_clipDistances);
+    emitClipCullStore(DxbcSystemValue::CullDistance, m_cullDistances);
+
+    for (const DxbcFusedOutput& out : m_fusedOutputs) {
+      DxbcRegisterPointer srcPtr;
+      srcPtr.type = out.type;
+      srcPtr.id   = out.srcId;
+
+      DxbcRegisterPointer dstPtr;
+      dstPtr.type = out.type;
+      dstPtr.id   = out.dstId;
+
+      emitValueStore(dstPtr, emitValueLoad(srcPtr),
+        DxbcRegMask::firstN(out.type.ccount));
+    }
+  }
+
+
+  void DxbcCompiler::emitFusedEmit(bool doEmit, bool doCut) {
+    // Vertices are assigned to output slots in order. Separate strips
+    // are joined using degenerate triangles: A cut duplicates the last
+    // vertex, and the first vertex of the next strip is repeated until
+    // it sits on an even slot so that the winding order is preserved.
+    const uint32_t u32Type  = getScalarTypeId(DxbcScalarType::Uint32);
+    const uint32_t boolType = m_module.defBoolType();
+
+    auto beginIf = [&] (uint32_t cond, uint32_t& labelEnd) {
+      const uint32_t labelIf = m_module.allocateId();
+      labelEnd = m_module.allocateId();
+
+      m_module.opSelectionMerge(labelEnd, spv::SelectionControlMaskNone);
+      m_module.opBranchConditional(cond, labelIf, labelEnd);
+      m_module.opLabel(labelIf);
+    };
+
+    auto endIf = [&] (uint32_t labelEnd) {
+      m_module.opBranch(labelEnd);
+      m_module.opLabel(labelEnd);
+    };
+
+    if (doEmit) {
+      const uint32_t slot   = m_module.opLoad(u32Type, m_fusedEmitCounter);
+      const uint32_t corner = m_module.opLoad(u32Type, m_fusedCornerId);
+
+      uint32_t lastSlot = slot;
+
+      if (m_fusedCuts) {
+        const uint32_t pending = m_module.opLoad(u32Type, m_fusedPending);
+        const uint32_t isPending = m_module.opINotEqual(boolType, pending, m_module.constu32(0));
+
+        // Last slot to write: slot + 2 - (slot & 1) if a cut precedes
+        const uint32_t odd = m_module.opBitwiseAnd(u32Type, slot, m_module.constu32(1));
+        const uint32_t bridged = m_module.opISub(u32Type,
+          m_module.opIAdd(u32Type, slot, m_module.constu32(2)), odd);
+        lastSlot = m_module.opSelect(u32Type, isPending, bridged, slot);
+      }
+
+      const uint32_t cond = m_module.opLogicalAnd(boolType,
+        m_module.opUGreaterThanEqual(boolType, corner, slot),
+        m_module.opULessThanEqual(boolType, corner, lastSlot));
+
+      uint32_t labelEnd;
+      beginIf(cond, labelEnd);
+      emitFusedCopyOutputs();
+      endIf(labelEnd);
+
+      m_module.opStore(m_fusedEmitCounter,
+        m_module.opIAdd(u32Type, lastSlot, m_module.constu32(1)));
+
+      if (m_fusedCuts)
+        m_module.opStore(m_fusedPending, m_module.constu32(0));
+    }
+
+    if (doCut) {
+      const uint32_t cutIndex = m_fusedCutIndex++;
+
+      if (cutIndex < m_fusedCuts) {
+        const uint32_t slot   = m_module.opLoad(u32Type, m_fusedEmitCounter);
+        const uint32_t corner = m_module.opLoad(u32Type, m_fusedCornerId);
+
+        // Nothing to join if no vertex has been emitted yet
+        uint32_t labelOuter;
+        beginIf(m_module.opINotEqual(boolType, slot, m_module.constu32(0)), labelOuter);
+
+        // The output registers still hold the last emitted vertex
+        uint32_t labelEnd;
+        beginIf(m_module.opIEqual(boolType, corner, slot), labelEnd);
+        emitFusedCopyOutputs();
+        endIf(labelEnd);
+
+        m_module.opStore(m_fusedEmitCounter,
+          m_module.opIAdd(u32Type, slot, m_module.constu32(1)));
+        m_module.opStore(m_fusedPending, m_module.constu32(1));
+        endIf(labelOuter);
+      }
+    }
+  }
+
+
+  void DxbcCompiler::emitFusedGsFinalize() {
+    if (!m_vsPart)
+      throw DxvkError("DxbcCompiler: GS emulation without vertex shader");
+
+    this->emitMainFunctionBegin();
+
+    // Initialize the position to zero so that vertices
+    // that are never written produce degenerate triangles
+    if (m_perVertexOut) {
+      const uint32_t memberId = m_module.consti32(PerVertex_Position);
+
+      DxbcRegisterPointer ptr;
+      ptr.type.ctype  = DxbcScalarType::Float32;
+      ptr.type.ccount = 4;
+      ptr.id = m_module.opAccessChain(
+        m_module.defPointerType(getVectorTypeId(ptr.type), spv::StorageClassOutput),
+        m_perVertexOut, 1, &memberId);
+
+      emitValueStore(ptr,
+        emitBuildConstVecf32(0.0f, 0.0f, 0.0f, 0.0f, DxbcRegMask::firstN(4)),
+        DxbcRegMask::firstN(4));
+    }
+
+    // Run the vertex shader for this input point
+    m_vsPart->emitInputSetup();
+    m_module.opFunctionCall(
+      m_module.defVoidType(),
+      m_vsPart->m_vs.functionId, 0, nullptr);
+
+    if (m_primitiveIdIn) {
+      m_module.opStore(m_primitiveIdIn, emitFusedPointIndex());
+    }
+
+    // Run the geometry shader
+    this->emitFusedLinkInputs();
+    this->emitInputSetup(primitiveVertexCount(m_gs.inputPrimitive));
+    m_module.opFunctionCall(
+      m_module.defVoidType(),
+      m_gs.functionId, 0, nullptr);
+
+    // If fewer vertices than the maximum were emitted, repeat
+    // the last vertex so that the remaining triangles are empty.
+    const uint32_t u32Type  = getScalarTypeId(DxbcScalarType::Uint32);
+    const uint32_t boolType = m_module.defBoolType();
+
+    const uint32_t counter = m_module.opLoad(u32Type, m_fusedEmitCounter);
+    const uint32_t corner  = m_module.opLoad(u32Type, m_fusedCornerId);
+
+    const uint32_t cond = m_module.opLogicalAnd(boolType,
+      m_module.opINotEqual(boolType, counter, m_module.constu32(0)),
+      m_module.opUGreaterThanEqual(boolType, corner, counter));
+
+    const uint32_t labelIf  = m_module.allocateId();
+    const uint32_t labelEnd = m_module.allocateId();
+
+    m_module.opSelectionMerge(labelEnd, spv::SelectionControlMaskNone);
+    m_module.opBranchConditional(cond, labelIf, labelEnd);
+
+    m_module.opLabel(labelIf);
+    emitFusedCopyOutputs();
+    m_module.opBranch(labelEnd);
+
+    m_module.opLabel(labelEnd);
+    this->emitFunctionEnd();
+
+    // Interfaces of the vertex shader part are part of the entry point
+    m_entryPointInterfaces.insert(m_entryPointInterfaces.end(),
+      m_vsPart->m_entryPointInterfaces.begin(),
+      m_vsPart->m_entryPointInterfaces.end());
+  }
+
+
   void DxbcCompiler::emitPsFinalize() {
     this->emitMainFunctionBegin();
     this->emitInputSetup();
