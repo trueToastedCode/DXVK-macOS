@@ -93,6 +93,7 @@ namespace dxvk {
     Rc<vk::Presenter>         m_presenter;
 
     Rc<DxvkImage>             m_swapImage;
+    Rc<DxvkImage>             m_resolveImage;
     Rc<DxvkImageView>         m_swapImageView;
     Rc<DxvkSwapchainBlitter>  m_blitter;
 

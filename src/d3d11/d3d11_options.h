@@ -112,6 +112,12 @@ namespace dxvk {
     /// performs the required shader and resolve fixups.
     bool disableMsaa;
 
+    /// Forces multisampling on the swap chain back buffer and on the depth
+    /// buffer that matches its size, without the application knowing.
+    /// 0 = off, otherwise the sample count (2, 4 or 8). Set through the
+    /// DXVK_FORCE_MSAA environment variable or d3d11.forceMsaa.
+    uint32_t forceMsaa;
+
     /// Dynamic resources with the given bind flags will be allocated
     /// in cached system memory. Enabled automatically when recording
     /// an api trace.

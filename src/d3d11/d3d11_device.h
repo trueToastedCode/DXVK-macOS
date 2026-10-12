@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <mutex>
 #include <vector>
 
@@ -413,6 +415,21 @@ namespace dxvk {
       return DxvkCsChunkRef(chunk, &m_csChunkPool);
     }
     
+    /**
+     * \brief Remembers the size of the back buffer that was forced to MSAA
+     *
+     * Depth buffers of the same size are forced to the same sample count
+     * so that they can be bound together with the back buffer.
+     */
+    void SetForcedMsaaReferenceSize(uint32_t Width, uint32_t Height) {
+      m_forcedMsaaRefSize.store((uint64_t(Width) << 32) | uint64_t(Height));
+    }
+
+    bool MatchesForcedMsaaReferenceSize(uint32_t Width, uint32_t Height) const {
+      uint64_t size = m_forcedMsaaRefSize.load();
+      return size != 0 && size == ((uint64_t(Width) << 32) | uint64_t(Height));
+    }
+
     const D3D11Options* GetOptions() const {
       return &m_d3d11Options;
     }
@@ -442,6 +459,7 @@ namespace dxvk {
     
     const DXGIVkFormatTable         m_d3d11Formats;
     const D3D11Options              m_d3d11Options;
+    std::atomic<uint64_t>           m_forcedMsaaRefSize = { 0 };
     const DxbcOptions               m_dxbcOptions;
     
     DxvkCsChunkPool                 m_csChunkPool;

@@ -1072,6 +1072,7 @@ namespace dxvk {
     
     D3D11CommonTexture* dstTextureInfo = GetCommonTexture(pDstResource);
     D3D11CommonTexture* srcTextureInfo = GetCommonTexture(pSrcResource);
+
     
     const DXGI_VK_FORMAT_INFO dstFormatInfo = m_parent->LookupFormat(dstDesc.Format, DXGI_VK_FORMAT_MODE_ANY);
     const DXGI_VK_FORMAT_INFO srcFormatInfo = m_parent->LookupFormat(srcDesc.Format, DXGI_VK_FORMAT_MODE_ANY);
@@ -1101,7 +1102,7 @@ namespace dxvk {
       srcSubresource.mipLevel,
       srcSubresource.arrayLayer, 1 };
     
-    if (srcDesc.SampleDesc.Count == 1 || m_parent->GetOptions()->disableMsaa) {
+    if ((srcDesc.SampleDesc.Count == 1 && !srcTextureInfo->IsForcedMsaa()) || m_parent->GetOptions()->disableMsaa) {
       EmitCs([
         cDstImage  = dstTextureInfo->GetImage(),
         cSrcImage  = srcTextureInfo->GetImage(),
@@ -3165,6 +3166,45 @@ namespace dxvk {
         m_state.om.depthStencilView->GetRenderLayout() };
     }
     
+    // With forced MSAA, a pass that mixes forced and regular targets would
+    // be invalid in Vulkan. Drop the attachments that do not match so that
+    // the pass renders incorrectly instead of crashing the driver.
+    if (unlikely(m_parent->GetOptions()->forceMsaa != 0)) {
+      VkSampleCountFlagBits expected = VK_SAMPLE_COUNT_1_BIT;
+      bool haveExpected = false;
+
+      if (attachments.depth.view != nullptr) {
+        expected = attachments.depth.view->imageInfo().sampleCount;
+        haveExpected = true;
+      }
+
+      for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
+        if (attachments.color[i].view == nullptr)
+          continue;
+
+        VkSampleCountFlagBits samples = attachments.color[i].view->imageInfo().sampleCount;
+
+        if (!haveExpected) {
+          expected = samples;
+          haveExpected = true;
+        } else if (samples != expected) {
+          static bool s_warned = false;
+
+          if (!std::exchange(s_warned, true)) {
+            Logger::warn("D3D11: Forced MSAA: render pass mixes sample counts, dropping mismatching attachments. "
+              "Narrow down which textures get forced MSAA if this affects rendering.");
+          }
+
+          attachments.color[i] = DxvkAttachment();
+        }
+      }
+
+      if (attachments.depth.view != nullptr && haveExpected) {
+        // Depth defined the expected count, nothing further to check
+      }
+    }
+
+
     // Create and bind the framebuffer object to the context
     EmitCs([
       cAttachments = std::move(attachments)
@@ -3283,9 +3323,50 @@ namespace dxvk {
   }
   
   
+  void D3D11DeviceContext::ResolveForcedMsaaTexture(
+          D3D11CommonTexture*               pTexture) {
+    Rc<DxvkImage> srcImage = pTexture->GetImage();
+    Rc<DxvkImage> dstImage = pTexture->GetResolveImage();
+
+    const VkImageAspectFlags aspects = imageFormatInfo(srcImage->info().format)->aspectMask;
+
+    VkImageResolve region;
+    region.srcSubresource = { (aspects & VK_IMAGE_ASPECT_COLOR_BIT)
+      ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+    region.srcOffset      = { 0, 0, 0 };
+    region.dstSubresource = region.srcSubresource;
+    region.dstOffset      = { 0, 0, 0 };
+    region.extent         = srcImage->mipLevelExtent(0);
+
+    if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+      EmitCs([
+        cDstImage = std::move(dstImage),
+        cSrcImage = std::move(srcImage),
+        cRegion   = region
+      ] (DxvkContext* ctx) {
+        ctx->resolveImage(cDstImage, cSrcImage, cRegion, VK_FORMAT_UNDEFINED);
+      });
+    } else {
+      // Only the depth aspect is resolved. Sampling stencil through a
+      // forced-MSAA texture is not supported.
+      EmitCs([
+        cDstImage = std::move(dstImage),
+        cSrcImage = std::move(srcImage),
+        cRegion   = region
+      ] (DxvkContext* ctx) {
+        ctx->resolveDepthStencilImage(cDstImage, cSrcImage, cRegion,
+          VK_RESOLVE_MODE_SAMPLE_ZERO_BIT_KHR, VK_RESOLVE_MODE_NONE_KHR);
+      });
+    }
+  }
+
+
   void D3D11DeviceContext::BindShaderResource(
           UINT                              Slot,
           D3D11ShaderResourceView*          pResource) {
+    if (unlikely(pResource != nullptr && pResource->GetForcedMsaaTexture() != nullptr))
+      ResolveForcedMsaaTexture(pResource->GetForcedMsaaTexture());
+
     EmitCs([
       cSlotId     = Slot,
       cImageView  = pResource != nullptr ? pResource->GetImageView()  : nullptr,
@@ -3301,6 +3382,7 @@ namespace dxvk {
           D3D11UnorderedAccessView*         pUav,
           UINT                              CtrSlot,
           UINT                              Counter) {
+
     EmitCs([
       cUavSlotId    = UavSlot,
       cCtrSlotId    = CtrSlot,
@@ -3374,6 +3456,16 @@ namespace dxvk {
     const VkImageSubresourceLayers*         pSrcLayers,
           VkOffset3D                        SrcOffset,
           VkExtent3D                        SrcExtent) {
+    if (unlikely(pDstTexture->IsForcedMsaa() || pSrcTexture->IsForcedMsaa())) {
+      static bool s_warned = false;
+
+      if (!std::exchange(s_warned, true))
+        Logger::warn("D3D11: Forced MSAA: copies from or to the back buffer or main depth buffer are not supported, skipping");
+
+      return;
+    }
+
+
     // Image formats must be size-compatible
     auto dstFormatInfo = imageFormatInfo(pDstTexture->GetPackedFormat());
     auto srcFormatInfo = imageFormatInfo(pSrcTexture->GetPackedFormat());
@@ -3983,6 +4075,8 @@ namespace dxvk {
         }
 
         Bindings.views[StartSlot + i] = resView;
+
+
         BindShaderResource(slotId + i, resView);
       }
     }

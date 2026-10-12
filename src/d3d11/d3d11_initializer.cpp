@@ -122,6 +122,15 @@ namespace dxvk {
     auto mapMode = pTexture->GetMapMode();
     auto desc = pTexture->Desc();
 
+    // Initial data cannot be uploaded to a multisampled image that
+    // the application believes to be single-sampled.
+    if (pTexture->IsForcedMsaa()) {
+      if (pInitialData != nullptr && pInitialData->pSysMem != nullptr)
+        Logger::warn("D3D11: Forced MSAA: ignoring initial data for multisampled texture");
+
+      pInitialData = nullptr;
+    }
+
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = imageFormatInfo(packedFormat);
 
@@ -187,6 +196,11 @@ namespace dxvk {
         subresources.layerCount     = desc->ArraySize;
 
         m_context->initImage(image, subresources, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        if (pTexture->IsForcedMsaa()) {
+          m_context->initImage(pTexture->GetResolveImage(),
+            subresources, VK_IMAGE_LAYOUT_UNDEFINED);
+        }
       }
 
       if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE) {

@@ -176,8 +176,19 @@ namespace dxvk {
       m_info.Image.NumLayers = viewInfo.numLayers;
 
       // Create the underlying image view object
-      m_imageView = pDevice->GetDXVKDevice()->createImageView(texture->GetImage(), viewInfo);
+      Rc<DxvkImage> srvImage = texture->GetImage();
+
+      // With forced MSAA, the multisampled image is not readable by
+      // shaders that expect a single-sampled texture. Read the resolved
+      // copy instead; it is refreshed whenever the view is bound.
+      if (texture->IsForcedMsaa()) {
+        srvImage = texture->GetResolveImage();
+        m_forcedMsaaTexture = texture;
+      }
+
+      m_imageView = pDevice->GetDXVKDevice()->createImageView(srvImage, viewInfo);
     }
+
   }
   
   

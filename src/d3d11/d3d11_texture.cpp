@@ -60,6 +60,29 @@ namespace dxvk {
     if (!pDevice->GetOptions()->disableMsaa)
       DecodeSampleCount(m_desc.SampleDesc.Count, &imageInfo.sampleCount);
 
+    // Forced MSAA: the swap chain back buffer, and the depth buffer that has the
+    // same size, become multisampled without the application noticing.
+    if (pDevice->GetOptions()->forceMsaa > 1
+     && vkImage == VK_NULL_HANDLE
+     && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+     && m_desc.SampleDesc.Count == 1
+     && m_desc.MipLevels == 1
+     && m_desc.ArraySize == 1
+     && m_desc.Usage == D3D11_USAGE_DEFAULT
+     && m_desc.CPUAccessFlags == 0
+     && !(m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+     && !(m_desc.MiscFlags & (D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_SHARED
+                            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE))) {
+      const bool isBackBuffer = (DxgiUsage & DXGI_USAGE_BACK_BUFFER) != 0;
+      const bool isMainDepth  = (m_desc.BindFlags & D3D11_BIND_DEPTH_STENCIL)
+        && pDevice->MatchesForcedMsaaReferenceSize(m_desc.Width, m_desc.Height);
+
+      if (isBackBuffer || isMainDepth) {
+        m_forcedSamples = VkSampleCountFlagBits(pDevice->GetOptions()->forceMsaa);
+        imageInfo.sampleCount = m_forcedSamples;
+      }
+    }
+
     if ((m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) && IsR32UavCompatibleFormat(m_desc.Format)) {
       formatFamily.Add(formatInfo.Format);
       formatFamily.Add(VK_FORMAT_R32_SFLOAT);
@@ -132,6 +155,14 @@ namespace dxvk {
       imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
     }
     
+    // Forced multisampled images are read through a resolve pass, which
+    // samples them, and depth resolves also write the destination.
+    if (m_forcedSamples != VK_SAMPLE_COUNT_1_BIT) {
+      imageInfo.usage  |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      imageInfo.stages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
+    }
+
     if (m_desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)
       imageInfo.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     
@@ -154,6 +185,7 @@ namespace dxvk {
     
     // Determine map mode based on our findings
     m_mapMode = DetermineMapMode(&imageInfo);
+
     
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
@@ -191,6 +223,15 @@ namespace dxvk {
     imageInfo.usage |= EnableMetaCopyUsage(imageInfo.format, imageInfo.tiling);
     imageInfo.usage |= EnableMetaPackUsage(imageInfo.format, m_desc.CPUAccessFlags);
     
+    // If the forced sample count is not supported for this exact image
+    // configuration, silently fall back to a single-sampled texture.
+    if (m_forcedSamples != VK_SAMPLE_COUNT_1_BIT && !CheckImageSupport(&imageInfo, imageInfo.tiling)) {
+      Logger::warn(str::format("D3D11: Forced MSAA not supported for ", m_desc.Width, "x", m_desc.Height,
+        " texture, format ", m_desc.Format, ", leaving it single-sampled"));
+      m_forcedSamples = VK_SAMPLE_COUNT_1_BIT;
+      imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    }
+
     // Check if we can actually create the image
     if (!CheckImageSupport(&imageInfo, imageInfo.tiling)) {
       throw DxvkError(str::format(
@@ -220,6 +261,44 @@ namespace dxvk {
 
     if (imageInfo.sharing.mode == DxvkSharedHandleMode::Export)
       ExportImageInfo();
+
+    // Create the single-sampled copy that shaders and the presenter read from
+    if (m_forcedSamples != VK_SAMPLE_COUNT_1_BIT) {
+      DxvkImageCreateInfo resolveInfo = imageInfo;
+      resolveInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      resolveInfo.shared      = VK_FALSE;
+      resolveInfo.sharing     = DxvkSharedHandleInfo();
+      resolveInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT
+                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                              | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                              | (isColorFormat
+                                  ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                  : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+      resolveInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT
+                              | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                              | pDevice->GetEnabledShaderStages()
+                              | (isColorFormat
+                                  ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                  : (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT));
+      resolveInfo.access      = VK_ACCESS_TRANSFER_READ_BIT
+                              | VK_ACCESS_TRANSFER_WRITE_BIT
+                              | VK_ACCESS_SHADER_READ_BIT
+                              | (isColorFormat
+                                  ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                                  : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT));
+      resolveInfo.layout      = OptimizeLayout(resolveInfo.usage);
+      resolveInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+      m_resolveImage = m_device->GetDXVKDevice()->createImage(
+        resolveInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+      if (DxgiUsage & DXGI_USAGE_BACK_BUFFER)
+        m_device->SetForcedMsaaReferenceSize(m_desc.Width, m_desc.Height);
+
+      Logger::info(str::format("D3D11: Forced ", uint32_t(m_forcedSamples), "x MSAA on ",
+        (DxgiUsage & DXGI_USAGE_BACK_BUFFER) ? "back buffer" : "depth buffer", " ",
+        m_desc.Width, "x", m_desc.Height, ", format ", m_desc.Format));
+    }
   }
   
   

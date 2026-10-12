@@ -1,10 +1,54 @@
+#include <cstdlib>
 #include <unordered_map>
 
 #include "d3d11_options.h"
 
+#include "../util/util_env.h"
+
 namespace dxvk {
-  
-  D3D11Options::D3D11Options(const Config& config, const Rc<DxvkDevice>& device) {
+
+  static uint32_t ResolveForcedMsaaSamples(
+    const Config&         config,
+    const DxvkDeviceInfo& devInfo,
+          bool            msaaDisabled) {
+    int32_t requested = config.getOption<int32_t>("d3d11.forceMsaa", 0);
+    std::string env = env::getEnvVar("DXVK_FORCE_MSAA");
+
+    if (!env.empty())
+      requested = int32_t(std::strtol(env.c_str(), nullptr, 10));
+
+    if (requested <= 1)
+      return 0;
+
+    if (msaaDisabled) {
+      Logger::warn("DXVK_FORCE_MSAA: ignored because d3d11.disableMsaa is enabled");
+      return 0;
+    }
+
+    const auto& limits = devInfo.core.properties.limits;
+    VkSampleCountFlags supported = limits.framebufferColorSampleCounts
+                                 & limits.framebufferDepthSampleCounts;
+
+    uint32_t result = 0;
+
+    for (uint32_t count : { 8u, 4u, 2u }) {
+      if (count <= uint32_t(requested) && (supported & count)) {
+        result = count;
+        break;
+      }
+    }
+
+    if (!result) {
+      Logger::warn("DXVK_FORCE_MSAA: no supported sample count, disabled");
+      return 0;
+    }
+
+    Logger::info(str::format("DXVK_FORCE_MSAA: forcing ", result, "x MSAA on the back buffer and its matching depth buffer",
+      result != uint32_t(requested) ? str::format(" (", requested, "x is not supported)") : std::string("")));
+    return result;
+  }
+
+    D3D11Options::D3D11Options(const Config& config, const Rc<DxvkDevice>& device) {
     const DxvkDeviceInfo& devInfo = device->properties();
 
     this->dcSingleUseMode       = config.getOption<bool>("d3d11.dcSingleUseMode", true);
@@ -19,6 +63,7 @@ namespace dxvk {
     this->refactoringAllowed    = config.getOption<bool>("d3d11.refactoringAllowed", false);
     this->floatControls         = config.getOption<bool>("d3d11.floatControls", true);
     this->disableMsaa           = config.getOption<bool>("d3d11.disableMsaa", false);
+    this->forceMsaa             = ResolveForcedMsaaSamples(config, devInfo, this->disableMsaa);
     this->deferSurfaceCreation  = config.getOption<bool>("dxgi.deferSurfaceCreation", false);
     this->numBackBuffers        = config.getOption<int32_t>("dxgi.numBackBuffers", 0);
     this->maxFrameLatency       = config.getOption<int32_t>("dxgi.maxFrameLatency", 0);

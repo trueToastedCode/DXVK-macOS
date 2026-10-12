@@ -25,6 +25,7 @@ namespace dxvk {
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
     CreateFrameLatencyEvent();
 
+
     if (!pDevice->GetOptions()->deferSurfaceCreation)
       CreatePresenter();
     
@@ -231,6 +232,7 @@ namespace dxvk {
     if (std::exchange(m_dirty, false))
       RecreateSwapChain(m_vsync);
     
+
     try {
       PresentImage(SyncInterval);
     } catch (const DxvkError& e) {
@@ -295,6 +297,18 @@ namespace dxvk {
       m_context->beginRecording(
         m_device->createCommandList());
       
+      if (m_resolveImage != nullptr) {
+        VkImageResolve region;
+        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.srcOffset      = { 0, 0, 0 };
+        region.dstSubresource = region.srcSubresource;
+        region.dstOffset      = { 0, 0, 0 };
+        region.extent         = m_swapImage->mipLevelExtent(0);
+
+        m_context->resolveImage(m_resolveImage, m_swapImage,
+          region, VK_FORMAT_UNDEFINED);
+      }
+
       m_blitter->presentImage(m_context.ptr(),
         m_imageViews.at(imageIndex), VkRect2D(),
         m_swapImageView, VkRect2D());
@@ -455,6 +469,7 @@ namespace dxvk {
     // Explicitly destroy current swap image before
     // creating a new one to free up resources
     m_swapImage         = nullptr;
+    m_resolveImage      = nullptr;
     m_swapImageView     = nullptr;
     m_backBuffer        = nullptr;
 
@@ -492,20 +507,30 @@ namespace dxvk {
       dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
 
     m_backBuffer = new D3D11Texture2D(m_parent, this, &desc, dxgiUsage);
-    m_swapImage = GetCommonTexture(m_backBuffer.ptr())->GetImage();
+    D3D11CommonTexture* backBufferInfo = GetCommonTexture(m_backBuffer.ptr());
+
+    m_swapImage = backBufferInfo->GetImage();
+
+    // With forced MSAA the back buffer is multisampled, so the presenter
+    // has to read from a resolved single-sample copy.
+    m_resolveImage = backBufferInfo->IsForcedMsaa()
+      ? backBufferInfo->GetResolveImage()
+      : nullptr;
+
+    Rc<DxvkImage> presentImage = m_resolveImage != nullptr ? m_resolveImage : m_swapImage;
 
     // Create an image view that allows the
     // image to be bound as a shader resource.
     DxvkImageViewCreateInfo viewInfo;
     viewInfo.type       = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format     = m_swapImage->info().format;
+    viewInfo.format     = presentImage->info().format;
     viewInfo.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
     viewInfo.aspect     = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.minLevel   = 0;
     viewInfo.numLevels  = 1;
     viewInfo.minLayer   = 0;
     viewInfo.numLayers  = 1;
-    m_swapImageView = m_device->createImageView(m_swapImage, viewInfo);
+    m_swapImageView = m_device->createImageView(presentImage, viewInfo);
     
     // Initialize the image so that we can use it. Clearing
     // to black prevents garbled output for the first frame.
@@ -521,6 +546,11 @@ namespace dxvk {
     
     m_context->initImage(m_swapImage,
       subresources, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    if (m_resolveImage != nullptr) {
+      m_context->initImage(m_resolveImage,
+        subresources, VK_IMAGE_LAYOUT_UNDEFINED);
+    }
 
     m_device->submitCommandList(
       m_context->endRecording(),

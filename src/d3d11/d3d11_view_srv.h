@@ -10,6 +10,7 @@
 namespace dxvk {
   
   class D3D11Device;
+  class D3D11CommonTexture;
   
   /**
    * \brief Shader resource view
@@ -61,6 +62,16 @@ namespace dxvk {
       return m_imageView;
     }
 
+    /**
+     * \brief Texture that must be resolved before this view is read
+     *
+     * Non-null if MSAA is forced on the underlying texture. The view
+     * itself reads the single-sample resolved copy of that texture.
+     */
+    D3D11CommonTexture* GetForcedMsaaTexture() const {
+      return m_forcedMsaaTexture;
+    }
+
     D3D10ShaderResourceView* GetD3D10Iface() {
       return &m_d3d10;
     }
@@ -87,6 +98,7 @@ namespace dxvk {
     D3D11_VK_VIEW_INFO                m_info;
     Rc<DxvkBufferView>                m_bufferView;
     Rc<DxvkImageView>                 m_imageView;
+    D3D11CommonTexture*               m_forcedMsaaTexture = nullptr;
     D3D10ShaderResourceView           m_d3d10;
 
   };

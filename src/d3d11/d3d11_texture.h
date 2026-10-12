@@ -189,6 +189,25 @@ namespace dxvk {
     Rc<DxvkImage> GetImage() const {
       return m_image;
     }
+
+    /**
+     * \brief Checks whether MSAA is forced on this texture
+     *
+     * The application still sees a single-sampled texture, but the
+     * underlying image is multisampled. Shaders must read the resolved
+     * single-sample copy returned by \ref GetResolveImage instead.
+     */
+    bool IsForcedMsaa() const {
+      return m_forcedSamples != VK_SAMPLE_COUNT_1_BIT;
+    }
+
+    VkSampleCountFlagBits GetForcedSampleCount() const {
+      return m_forcedSamples;
+    }
+
+    Rc<DxvkImage> GetResolveImage() const {
+      return m_resolveImage;
+    }
     
     /**
      * \brief Mapped subresource buffer
@@ -393,6 +412,8 @@ namespace dxvk {
     VkFormat                      m_packedFormat;
     
     Rc<DxvkImage>                 m_image;
+    Rc<DxvkImage>                 m_resolveImage;
+    VkSampleCountFlagBits         m_forcedSamples = VK_SAMPLE_COUNT_1_BIT;
     std::vector<MappedBuffer>     m_buffers;
     std::vector<MappedInfo>       m_mapInfo;
     

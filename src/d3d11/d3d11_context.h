@@ -730,6 +730,9 @@ namespace dxvk {
       const D3D11CommonShader*                pShaderModule);
     
     void BindFramebuffer();
+
+    void ResolveForcedMsaaTexture(
+            D3D11CommonTexture*               pTexture);
     
     void BindDrawBuffers(
             D3D11Buffer*                      pBufferForArgs,
